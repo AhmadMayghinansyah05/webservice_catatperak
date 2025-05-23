@@ -205,6 +205,41 @@ def get_accounts():
     accs = db.accounts.find({"user_id": ObjectId(user_id)})
     return jsonify([account_schema(a) for a in accs])
 
+# UPDATE rekening
+@app.route("/account/<acc_id>", methods=["PUT"])
+@jwt_required()
+def update_account(acc_id):
+    user_id = get_jwt_identity()
+    data = request.json
+
+    if not data.get("name"):
+        return jsonify({"msg": "Nama rekening wajib diisi"}), 400
+
+    acc = db.accounts.find_one({"_id": ObjectId(acc_id), "user_id": ObjectId(user_id)})
+    if not acc:
+        return jsonify({"msg": "Rekening tidak ditemukan"}), 404
+
+    db.accounts.update_one({"_id": ObjectId(acc_id)}, {"$set": {"name": data["name"]}})
+    return jsonify({"msg": "Rekening berhasil diperbarui"})
+
+
+# DELETE rekening
+@app.route("/account/<acc_id>", methods=["DELETE"])
+@jwt_required()
+def delete_account(acc_id):
+    user_id = get_jwt_identity()
+    acc = db.accounts.find_one({"_id": ObjectId(acc_id), "user_id": ObjectId(user_id)})
+    if not acc:
+        return jsonify({"msg": "Rekening tidak ditemukan"}), 404
+
+    # Cek apakah masih ada transaksi yang pakai rekening ini
+    if db.transactions.find_one({"user_id": ObjectId(user_id), "account": acc["name"]}):
+        return jsonify({"msg": "Tidak bisa hapus. Rekening masih digunakan dalam transaksi"}), 400
+
+    db.accounts.delete_one({"_id": ObjectId(acc_id)})
+    return jsonify({"msg": "Rekening berhasil dihapus"})
+
+
 #   ===== TRANSACTIONS  =====
 @app.route("/transaction", methods=["POST"])
 @jwt_required()
@@ -236,6 +271,74 @@ def get_transactions():
     user_id = get_jwt_identity()
     txns = db.transactions.find({"user_id": ObjectId(user_id)})
     return jsonify([transaction_schema(t) for t in txns])
+
+# UPDATE transaksi
+@app.route("/transaction/<txn_id>", methods=["PUT"])
+@jwt_required()
+def update_transaction(txn_id):
+    user_id = get_jwt_identity()
+    data = request.json
+
+    # Validasi input
+    if not all(key in data for key in ("type", "name", "item", "price", "account")):
+        return jsonify({"msg": "Field wajib: type, name, item, price, account"}), 400
+
+    try:
+        data["price"] = float(data["price"])
+    except:
+        return jsonify({"msg": "Harga harus berupa angka"}), 400
+
+    txn = db.transactions.find_one({"_id": ObjectId(txn_id), "user_id": ObjectId(user_id)})
+    if not txn:
+        return jsonify({"msg": "Transaksi tidak ditemukan"}), 404
+
+    # Rollback saldo lama
+    acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": txn["account"]})
+    if acc:
+        rollback = txn["price"] if txn["type"] == "income" else -txn["price"]
+        db.accounts.update_one({"_id": acc["_id"]}, {"$inc": {"balance": -rollback}})
+
+    # Update transaksi
+    db.transactions.update_one(
+        {"_id": ObjectId(txn_id)},
+        {"$set": {
+            "type": data["type"],
+            "name": data["name"],
+            "item": data["item"],
+            "price": data["price"],
+            "account": data["account"],
+            "note": data.get("note", ""),
+            "date": datetime.now()
+        }}
+    )
+
+    # Update saldo baru
+    new_acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": data["account"]})
+    if new_acc:
+        adj = data["price"] if data["type"] == "income" else -data["price"]
+        db.accounts.update_one({"_id": new_acc["_id"]}, {"$inc": {"balance": adj}})
+
+    return jsonify({"msg": "Transaksi berhasil diperbarui"})
+
+
+# DELETE transaksi
+@app.route("/transaction/<txn_id>", methods=["DELETE"])
+@jwt_required()
+def delete_transaction(txn_id):
+    user_id = get_jwt_identity()
+    txn = db.transactions.find_one({"_id": ObjectId(txn_id), "user_id": ObjectId(user_id)})
+    if not txn:
+        return jsonify({"msg": "Transaksi tidak ditemukan"}), 404
+
+    # Update saldo rollback
+    acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": txn["account"]})
+    if acc:
+        adj = txn["price"] if txn["type"] == "income" else -txn["price"]
+        db.accounts.update_one({"_id": acc["_id"]}, {"$inc": {"balance": -adj}})
+
+    db.transactions.delete_one({"_id": ObjectId(txn_id)})
+    return jsonify({"msg": "Transaksi berhasil dihapus"})
+
 
 #   =====   SUMMARY =====
 @app.route("/summary", methods=["GET"])
