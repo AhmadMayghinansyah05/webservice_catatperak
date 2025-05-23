@@ -1,0 +1,22 @@
+<!-- templates/admin_dashboard.html -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Dashboard Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-8">
+  <div class="max-w-4xl mx-auto bg-white shadow p-6 rounded">
+    <h1 class="text-2xl font-bold mb-4">Dashboard Admin</h1>
+    <p>Selamat datang, {{ username }} 👋</p>
+    <hr class="my-4">
+
+    <div class="space-y-2">
+      <a href="{{ url_for('admin_get_users') }}" class="text-blue-600 hover:underline">📄 Lihat Semua User (JSON)</a><br>
+      <a href="{{ url_for('admin_get_transactions') }}" class="text-blue-600 hover:underline">📄 Lihat Semua Transaksi (JSON)</a><br>
+      <a href="{{ url_for('admin_logout') }}" class="text-red-500 hover:underline">🚪 Logout</a>
+    </div>
+  </div>
+</body>
+</html>
