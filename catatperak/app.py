@@ -6,11 +6,13 @@ from bson import ObjectId
 from datetime import datetime
 import pytesseract
 from PIL import Image
+from datetime import timedelta
 
 app = Flask(__name__)
 
 #   =====   CONFIG  =====
 app.config["JWT_SECRET_KEY"] = "catatkunci"
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 client = MongoClient("mongodb://localhost:27017/")
 db = client["ocr_finance_db"]
 jwt = JWTManager(app)
