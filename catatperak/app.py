@@ -7,6 +7,8 @@ from datetime import datetime
 import pytesseract
 from PIL import Image
 from datetime import timedelta
+import random
+import string
 
 app = Flask(__name__)
 
@@ -16,6 +18,7 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 client = MongoClient("mongodb://localhost:27017/")
 db = client["ocr_finance_db"]
 jwt = JWTManager(app)
+
 
 
 #   =====   PAGE    =====
@@ -180,11 +183,31 @@ def register():
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
-    user = db.users.find_one({"username": data["username"]})
-    if not user or not check_password_hash(user["password"], data["password"]):
-        return jsonify({"msg": "Username atau password salah"}), 401
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"msg": "Email dan password wajib diisi"}), 400
+
+    user = db.users.find_one({"email": email})
+    if not user or not check_password_hash(user["password"], password):
+        return jsonify({"msg": "Email atau password salah"}), 401
+
     token = create_access_token(identity=str(user["_id"]))
-    return jsonify({"access_token": token})
+    return jsonify({
+        "access_token": token,
+        "username": user["username"],
+        "email": user["email"]
+    })
+
+
+@app.route("/logout", methods=["POST"])
+@jwt_required()
+def logout():
+    # Di JWT tidak bisa "logout" server-side tanpa blacklist
+    return jsonify({"msg": "Logout berhasil. Silakan hapus token di client."}), 200
+
+
 
 #   =====   ACCOUNT =====
 @app.route("/account", methods=["POST"])
