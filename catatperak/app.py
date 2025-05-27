@@ -3,21 +3,34 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from werkzeug.security import generate_password_hash, check_password_hash
 from pymongo import MongoClient
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytesseract
 from PIL import Image
-from datetime import timedelta
+from flask_mail import Mail, Message
 import random
 import string
+import cv2
+import re
+import os
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
 #   =====   CONFIG  =====
 app.config["JWT_SECRET_KEY"] = "catatkunci"
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
+app.secret_key = "uniqekey"
 client = MongoClient("mongodb://localhost:27017/")
 db = client["ocr_finance_db"]
 jwt = JWTManager(app)
+
+#   =====   CONFIG EMAIL    =====
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'eghinansyah554@gmail.com' 
+app.config['MAIL_PASSWORD'] = 'sget djzi easq efec'
+mail = Mail(app)
 
 
 
@@ -113,6 +126,20 @@ def admin_delete_transaction(txn_id):
 
     return jsonify({"msg": "Transaksi berhasil dihapus"})
 
+#   =====   ADMIN MANAGE    =====
+@app.route("/admin/manage-users")
+def admin_manage_users():
+    if "admin_id" not in session:
+        return redirect(url_for("admin_login"))
+    return render_template("admin_users.html")
+
+@app.route("/admin/manage-transactions")
+def admin_manage_transactions():
+    if "admin_id" not in session:
+        return redirect(url_for("admin_login"))
+    return render_template("admin_transactions.html")
+
+
 #   =====   ADMIN LOGIN PAGE    =====
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
@@ -154,30 +181,68 @@ def register():
     password = data.get("password")
     confirm_password = data.get("confirm_password")
 
-    # Validasi input kosong
     if not all([username, email, password, confirm_password]):
         return jsonify({"msg": "Semua field wajib diisi"}), 400
 
-    # Password cocok?
     if password != confirm_password:
         return jsonify({"msg": "Password dan konfirmasi tidak cocok"}), 400
 
-    # Cek email & username
     if db.users.find_one({"username": username}):
         return jsonify({"msg": "Username sudah terdaftar"}), 400
 
     if db.users.find_one({"email": email}):
         return jsonify({"msg": "Email sudah terdaftar"}), 400
 
-    # Simpan user
+    otp = str(random.randint(100000, 999999))
+
     user = {
         "username": username,
         "email": email,
         "password": generate_password_hash(password),
-        "role": "user"
+        "role": "user",
+        "verified": False,
+        "otp": otp,
+        "otp_created": datetime.now()
     }
+
     db.users.insert_one(user)
-    return jsonify({"msg": "Registrasi berhasil"}), 201
+
+    try:
+        msg = Message(
+            subject="Kode Verifikasi Akun",
+            sender=app.config["MAIL_USERNAME"],
+            recipients=[email],
+            body=f"Halo {username},\n\nKode OTP verifikasi kamu adalah: {otp}\n\nMasukkan kode ini di aplikasi untuk mengaktifkan akun kamu."
+        )
+        mail.send(msg)
+    except Exception as e:
+        return jsonify({"msg": f"Registrasi gagal saat kirim email: {str(e)}"}), 500
+
+    return jsonify({"msg": "Registrasi berhasil. Silakan cek email untuk OTP verifikasi."}), 201
+
+
+@app.route("/verify-otp", methods=["POST"])
+def verify_otp():
+    data = request.json
+    email = data.get("email")
+    otp = data.get("otp")
+
+    user = db.users.find_one({"email": email})
+    if not user:
+        return jsonify({"msg": "User tidak ditemukan"}), 404
+
+    if user.get("verified"):
+        return jsonify({"msg": "Akun sudah diverifikasi"}), 400
+
+    if user.get("otp") != otp:
+        return jsonify({"msg": "Kode OTP salah"}), 400
+
+    db.users.update_one({"_id": user["_id"]}, {
+        "$set": {"verified": True},
+        "$unset": {"otp": "", "otp_created": ""}
+    })
+
+    return jsonify({"msg": "Verifikasi berhasil. Silakan login."}), 200
 
 
 @app.route("/login", methods=["POST"])
@@ -192,6 +257,9 @@ def login():
     user = db.users.find_one({"email": email})
     if not user or not check_password_hash(user["password"], password):
         return jsonify({"msg": "Email atau password salah"}), 401
+
+    if not user.get("verified", False):
+        return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
 
     token = create_access_token(identity=str(user["_id"]))
     return jsonify({
@@ -376,15 +444,76 @@ def get_summary():
     return jsonify({"total_income": income, "total_expense": expense})
 
 #   =====   OCR =====
+
 @app.route("/ocr", methods=["POST"])
+@jwt_required()
 def ocr_upload():
+    user_id = get_jwt_identity()
+
     if "image" not in request.files:
         return jsonify({"msg": "No image file"}), 400
+
+    account = request.form.get("account", "Cash")
+
     image = request.files["image"]
-    path = f"temp_{datetime.now().timestamp()}.jpg"
+    filename = secure_filename(image.filename)
+    path = os.path.join("uploads", filename)
+    os.makedirs("uploads", exist_ok=True)
     image.save(path)
-    text = extract_text_from_image(path)
-    return jsonify({"text": text})
+
+    # --- PREPROCESS ---
+    img = cv2.imread(path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    # --- OCR ---
+    custom_config = r'--oem 3 --psm 6 -l ind'
+    text = pytesseract.image_to_string(thresh, config=custom_config)
+
+    # --- PARSE ---
+    lines = text.split("\n")
+    pattern = r"(.+?)\s+(Rp[\s]?[\d\.,]+)"
+    results = []
+
+    for line in lines:
+        line = line.strip()
+        if len(line) < 5:
+            continue
+
+        match = re.search(pattern, line)
+        if match:
+            item = match.group(1)
+            price_str = match.group(2).replace("Rp", "").replace(" ", "").replace(".", "").replace(",", ".")
+            try:
+                price = float(price_str)
+                # Simpan ke DB
+                txn = {
+                    "user_id": ObjectId(user_id),
+                    "type": "expense",
+                    "name": item,
+                    "item": item,
+                    "price": price,
+                    "account": account,
+                    "note": "Ditambahkan via OCR",
+                    "date": datetime.now()
+                }
+                db.transactions.insert_one(txn)
+
+                # Tambahkan ke hasil untuk dikembalikan ke client
+                results.append({
+                    "item": item,
+                    "price": price
+                })
+            except ValueError:
+                continue
+
+    os.remove(path)
+
+    return jsonify({
+        "msg": "Transaksi berhasil ditambahkan dari hasil OCR",
+        "data": results
+    })
 
 #   =====   RUN =====
 if __name__ == "__main__":
