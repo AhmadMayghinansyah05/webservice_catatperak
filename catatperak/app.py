@@ -248,15 +248,15 @@ def verify_otp():
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
-    email = data.get("email")
+    username = data.get("username")
     password = data.get("password")
 
-    if not email or not password:
-        return jsonify({"msg": "Email dan password wajib diisi"}), 400
+    if not username or not password:
+        return jsonify({"msg": "Username dan password wajib diisi"}), 400
 
-    user = db.users.find_one({"email": email})
+    user = db.users.find_one({"username": username})
     if not user or not check_password_hash(user["password"], password):
-        return jsonify({"msg": "Email atau password salah"}), 401
+        return jsonify({"msg": "Username atau password salah"}), 401
 
     if not user.get("verified", False):
         return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
@@ -267,6 +267,59 @@ def login():
         "username": user["username"],
         "email": user["email"]
     })
+
+@app.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.json
+    email = data.get("email")
+
+    user = db.users.find_one({"email": email})
+    if not user:
+        return jsonify({"msg": "Email tidak ditemukan"}), 404
+
+    otp = str(random.randint(100000, 999999))
+    db.users.update_one({"_id": user["_id"]}, {
+        "$set": {
+            "reset_otp": otp,
+            "reset_otp_created": datetime.now()
+        }
+    })
+
+    try:
+        msg = Message(
+            subject="Reset Password OTP",
+            sender=app.config["MAIL_USERNAME"],
+            recipients=[email],
+            body=f"Halo {user['username']},\n\nKode OTP untuk reset password adalah: {otp}\nMasukkan kode ini untuk mengatur ulang password kamu."
+        )
+        mail.send(msg)
+    except Exception as e:
+        return jsonify({"msg": f"Gagal mengirim OTP: {str(e)}"}), 500
+
+    return jsonify({"msg": "OTP untuk reset password telah dikirim ke email."}), 200
+
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password():
+    data = request.json
+    email = data.get("email")
+    otp = data.get("otp")
+    new_password = data.get("new_password")
+
+    user = db.users.find_one({"email": email})
+    if not user:
+        return jsonify({"msg": "User tidak ditemukan"}), 404
+
+    if user.get("reset_otp") != otp:
+        return jsonify({"msg": "Kode OTP salah"}), 400
+
+    hashed = generate_password_hash(new_password)
+    db.users.update_one({"_id": user["_id"]}, {
+        "$set": {"password": hashed},
+        "$unset": {"reset_otp": "", "reset_otp_created": ""}
+    })
+
+    return jsonify({"msg": "Password berhasil direset. Silakan login dengan password baru."}), 200
 
 
 @app.route("/logout", methods=["POST"])
