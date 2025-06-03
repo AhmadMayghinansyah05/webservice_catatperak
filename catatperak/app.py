@@ -13,8 +13,13 @@ import cv2
 import re
 import os
 from werkzeug.utils import secure_filename
+from flask_cors import CORS
+import numpy as np
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 app = Flask(__name__)
+CORS(app)
 
 #   =====   CONFIG  =====
 app.config["JWT_SECRET_KEY"] = "catatkunci"
@@ -173,26 +178,31 @@ def admin_logout():
 
 
 #   =====   AUTH    =====
+from flask import request, jsonify
+from werkzeug.security import generate_password_hash
+from datetime import datetime
+import random
+from flask_mail import Message
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.json
     username = data.get("username")
     email = data.get("email")
     password = data.get("password")
-    confirm_password = data.get("confirm_password")
 
-    if not all([username, email, password, confirm_password]):
-        return jsonify({"msg": "Semua field wajib diisi"}), 400
+    # Validasi input kosong
+    if not all([username, email, password]):
+        return jsonify({"msg": "Username, email, dan password wajib diisi"}), 400
 
-    if password != confirm_password:
-        return jsonify({"msg": "Password dan konfirmasi tidak cocok"}), 400
-
+    # Cek username dan email sudah digunakan
     if db.users.find_one({"username": username}):
         return jsonify({"msg": "Username sudah terdaftar"}), 400
 
     if db.users.find_one({"email": email}):
         return jsonify({"msg": "Email sudah terdaftar"}), 400
 
+    # Generate OTP dan waktu buatnya
     otp = str(random.randint(100000, 999999))
 
     user = {
@@ -234,6 +244,10 @@ def verify_otp():
     if user.get("verified"):
         return jsonify({"msg": "Akun sudah diverifikasi"}), 400
 
+    # Tambahkan pengecekan OTP kadaluarsa di sini
+    if "otp_created" not in user or (datetime.now() - user["otp_created"]) > timedelta(minutes=10):
+        return jsonify({"msg": "Kode OTP sudah kedaluwarsa"}), 400
+
     if user.get("otp") != otp:
         return jsonify({"msg": "Kode OTP salah"}), 400
 
@@ -243,7 +257,6 @@ def verify_otp():
     })
 
     return jsonify({"msg": "Verifikasi berhasil. Silakan login."}), 200
-
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -310,16 +323,22 @@ def reset_password():
     if not user:
         return jsonify({"msg": "User tidak ditemukan"}), 404
 
+    if "reset_otp_created" not in user or (datetime.now() - user["reset_otp_created"]) > timedelta(minutes=10):
+        return jsonify({"msg": "Kode OTP sudah kedaluwarsa"}), 400
+
     if user.get("reset_otp") != otp:
         return jsonify({"msg": "Kode OTP salah"}), 400
 
-    hashed = generate_password_hash(new_password)
-    db.users.update_one({"_id": user["_id"]}, {
-        "$set": {"password": hashed},
-        "$unset": {"reset_otp": "", "reset_otp_created": ""}
-    })
+    db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {"password": generate_password_hash(new_password)},
+            "$unset": {"reset_otp": "", "reset_otp_created": ""}
+        }
+    )
 
     return jsonify({"msg": "Password berhasil direset. Silakan login dengan password baru."}), 200
+
 
 
 @app.route("/logout", methods=["POST"])
@@ -498,75 +517,64 @@ def get_summary():
 
 #   =====   OCR =====
 
-@app.route("/ocr", methods=["POST"])
-@jwt_required()
-def ocr_upload():
-    user_id = get_jwt_identity()
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image uploaded'}), 400
 
-    if "image" not in request.files:
-        return jsonify({"msg": "No image file"}), 400
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'Empty filename'}), 400
 
-    account = request.form.get("account", "Cash")
+    try:
+        # Baca gambar dari stream
+        in_memory_file = file.read()
+        npimg = np.frombuffer(in_memory_file, np.uint8)
+        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
-    image = request.files["image"]
-    filename = secure_filename(image.filename)
-    path = os.path.join("uploads", filename)
-    os.makedirs("uploads", exist_ok=True)
-    image.save(path)
+        # Preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
-    # --- PREPROCESS ---
-    img = cv2.imread(path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # OCR
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(thresh, config=custom_config)
 
-    # --- OCR ---
-    custom_config = r'--oem 3 --psm 6 -l ind'
-    text = pytesseract.image_to_string(thresh, config=custom_config)
+        # Ekstraksi item + harga
+        lines = text.split('\n')
+        extracted_items = []
 
-    # --- PARSE ---
-    lines = text.split("\n")
-    pattern = r"(.+?)\s+(Rp[\s]?[\d\.,]+)"
-    results = []
+        for line in lines:
+            line = line.strip()
+            match = re.search(r'^(.*?)[\s\-:]+Rp?\s?([\d\.,]+)', line)
+            if match:
+                nama_item = match.group(1).strip()
+                harga_str = match.group(2).replace('.', '').replace(',', '.')
+                try:
+                    harga = float(harga_str)
+                except:
+                    continue
 
-    for line in lines:
-        line = line.strip()
-        if len(line) < 5:
-            continue
+                # Saring baris total/metode
+                if 'total' in nama_item.lower() or 'metode' in nama_item.lower():
+                    continue
 
-        match = re.search(pattern, line)
-        if match:
-            item = match.group(1)
-            price_str = match.group(2).replace("Rp", "").replace(" ", "").replace(".", "").replace(",", ".")
-            try:
-                price = float(price_str)
-                # Simpan ke DB
-                txn = {
-                    "user_id": ObjectId(user_id),
-                    "type": "expense",
-                    "name": item,
-                    "item": item,
-                    "price": price,
-                    "account": account,
-                    "note": "Ditambahkan via OCR",
-                    "date": datetime.now()
-                }
-                db.transactions.insert_one(txn)
-
-                # Tambahkan ke hasil untuk dikembalikan ke client
-                results.append({
-                    "item": item,
-                    "price": price
+                extracted_items.append({
+                    "nama": nama_item,
+                    "harga": harga
                 })
-            except ValueError:
-                continue
 
-    os.remove(path)
+        waktu_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    return jsonify({
-        "msg": "Transaksi berhasil ditambahkan dari hasil OCR",
-        "data": results
-    })
+        return jsonify({
+            "waktu": waktu_now,
+            "items": extracted_items
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 #   =====   RUN =====
 if __name__ == "__main__":
