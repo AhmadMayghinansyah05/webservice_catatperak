@@ -33,5 +33,5 @@ Aplikasi backend berbasis Flask dan MongoDB yang memungkinkan pengguna mencatat 
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/namakamu/ocr-finance-app.git
-cd ocr-finance-app
+git clone https://github.com/namakamu/catatperak.git
+cd catatperak
