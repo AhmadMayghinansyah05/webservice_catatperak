@@ -26,7 +26,7 @@ app.config["JWT_SECRET_KEY"] = "catatkunci"
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 app.secret_key = "uniqekey"
 client = MongoClient("mongodb://localhost:27017/")
-db = client["ocr_finance_db"]
+db = client["capstone_app_db"]
 jwt = JWTManager(app)
 
 #   =====   CONFIG EMAIL    =====
@@ -54,12 +54,13 @@ def transaction_schema(txn):
         "user_id": str(txn["user_id"]),
         "type": txn["type"],
         "name": txn["name"],
-        "item": txn["item"],
-        "price": txn["price"],
+        "items": txn["items"],  # ganti dari 'item' ke 'items'
+        "total_price": txn["total_price"],  # ganti dari 'price'
         "account": txn["account"],
         "note": txn.get("note", ""),
-        "date": txn["date"]
+        "date": txn["date"].isoformat()  # convert datetime to string for JSON
     }
+
 
 def account_schema(acc):
     return {"id": str(acc["_id"]), "user_id": str(acc["user_id"]), "name": acc["name"], "balance": acc["balance"]}
@@ -191,18 +192,12 @@ def register():
     email = data.get("email")
     password = data.get("password")
 
-    # Validasi input kosong
-    if not all([username, email, password]):
-        return jsonify({"msg": "Username, email, dan password wajib diisi"}), 400
-
-    # Cek username dan email sudah digunakan
     if db.users.find_one({"username": username}):
         return jsonify({"msg": "Username sudah terdaftar"}), 400
 
     if db.users.find_one({"email": email}):
         return jsonify({"msg": "Email sudah terdaftar"}), 400
 
-    # Generate OTP dan waktu buatnya
     otp = str(random.randint(100000, 999999))
 
     user = {
@@ -264,15 +259,13 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    if not username or not password:
-        return jsonify({"msg": "Username dan password wajib diisi"}), 400
-
     user = db.users.find_one({"username": username})
+
     if not user or not check_password_hash(user["password"], password):
         return jsonify({"msg": "Username atau password salah"}), 401
 
-    if not user.get("verified", False):
-        return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
+    # if not user.get("verified", False):
+    #     return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
 
     token = create_access_token(identity=str(user["_id"]))
     return jsonify({
@@ -384,7 +377,7 @@ def update_account(acc_id):
     if not acc:
         return jsonify({"msg": "Rekening tidak ditemukan"}), 404
 
-    db.accounts.update_one({"_id": ObjectId(acc_id)}, {"$set": {"name": data["name"]}})
+    db.accounts.update_one({"_id": ObjectId(acc_id)}, {"$set": {"name": data["name"], 'balance' : data['balance']}})
     return jsonify({"msg": "Rekening berhasil diperbarui"})
 
 
@@ -411,12 +404,19 @@ def delete_account(acc_id):
 def add_transaction():
     user_id = get_jwt_identity()
     data = request.json
+
+    items = data.get("items", [])
+    if not items or not isinstance(items, list):
+        return jsonify({'msg' : 'Item harus berupa list'}), 400
+
+    total_price = sum(item['price'] for item in items)
+
     txn = {
         "user_id": ObjectId(user_id),
         "type": data["type"],  # income / expense
         "name": data["name"],
-        "item": data["item"],
-        "price": data["price"],
+        "items": items,
+        "total_price": total_price,
         "account": data["account"],
         "note": data.get("note", ""),
         "date": datetime.now()
@@ -426,7 +426,11 @@ def add_transaction():
     # Update account balance    
     acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": data["account"]})
     if acc:
-        new_balance = acc["balance"] + data["price"] if data["type"] == "income" else acc["balance"] - data["price"]
+        if data['type'] == "income":
+            new_balance = acc['balance'] + total_price
+        if data['type'] == "expense":
+            new_balance = acc['balance'] - total_price
+
         db.accounts.update_one({"_id": acc["_id"]}, {"$set": {"balance": new_balance}})
     return jsonify({"msg": "Transaksi ditambahkan"}), 201
 
@@ -498,7 +502,7 @@ def delete_transaction(txn_id):
     # Update saldo rollback
     acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": txn["account"]})
     if acc:
-        adj = txn["price"] if txn["type"] == "income" else -txn["price"]
+        adj = txn["total_price"] if txn["type"] == "income" else -txn["total_price"]
         db.accounts.update_one({"_id": acc["_id"]}, {"$inc": {"balance": -adj}})
 
     db.transactions.delete_one({"_id": ObjectId(txn_id)})
