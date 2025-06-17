@@ -27,6 +27,7 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 app.secret_key = "uniqekey"
 client = MongoClient("mongodb://localhost:27017/")
 db = client["capstone_app_db"]
+audit_logs = db["audit_logs"]
 jwt = JWTManager(app)
 
 #   =====   CONFIG EMAIL    =====
@@ -43,6 +44,13 @@ mail = Mail(app)
 @app.route("/")
 def landing_page():
     return render_template("index.html")
+
+@app.route("/admin/audit-logs-page")
+@jwt_required()
+def audit_logs_page():
+    if not is_admin(get_jwt_identity()):
+        return redirect(url_for('admin_login'))
+    return render_template("admin_audit_logs.html", username=session.get("admin_username"))
 
 #   =====   UTILS   =====
 def user_schema(user):
@@ -68,6 +76,15 @@ def account_schema(acc):
 def extract_text_from_image(path):
     img = Image.open(path)
     return pytesseract.image_to_string(img)
+
+def log_activity(user_id, action, details=None):
+    log_entry = {
+        "user_id": ObjectId(user_id),
+        "action": action,  # Misal: "login", "register", "reset_password"
+        "details": details or {},  # Data tambahan (misal: email, IP, dll)
+        "timestamp": datetime.now()
+    }
+    audit_logs.insert_one(log_entry)
 
 #   =====   UTILS: Admin Check  =====
 def is_admin(user_id):
@@ -150,16 +167,41 @@ def admin_manage_transactions():
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        # Debugging: Print input values
+        print(f"Login attempt - Username: {username}, Password: {password}")
 
         user = db.users.find_one({"username": username})
-        if user and user.get("role") == "admin" and check_password_hash(user["password"], password):
-            session["admin_id"] = str(user["_id"])
-            session["admin_username"] = user["username"]
-            return redirect(url_for("admin_dashboard"))
+        
+        # Debugging: Print user data
+        if user:
+            print(f"User found: {user}, Role: {user.get('role')}")
         else:
-            return render_template("admin_login.html", error="Login gagal. Coba lagi.")
+            print("User not found")
+
+        # Enhanced validation
+        if not user or user.get("role", "").lower() != "admin":
+            print("Role validation failed")
+            return render_template("admin_login.html", 
+                                error="Akses ditolak. Hanya admin yang boleh login"), 403
+
+        if not check_password_hash(user["password"], password):
+            print("Password mismatch")
+            return render_template("admin_login.html", 
+                                error="Username atau password salah"), 401
+
+        # Secure session setup
+        session.permanent = True
+        session["admin_id"] = str(user["_id"])
+        session["admin_username"] = user["username"]
+        session["admin_logged_in"] = True
+
+        # Debugging: Print session after set
+        print(f"Session after login: {dict(session)}")
+
+        return redirect(url_for("admin_dashboard"))
 
     return render_template("admin_login.html")
 
@@ -176,6 +218,41 @@ def admin_logout():
     session.pop("admin_id", None)
     session.pop("admin_username", None)
     return redirect(url_for("admin_login"))
+
+
+@app.route("/admin/recent-auth-logs", methods=["GET"])
+@jwt_required()
+def get_recent_auth_logs():
+    if not is_admin(get_jwt_identity()):
+        return jsonify({"msg": "Unauthorized"}), 403
+    
+    page = int(request.args.get('page', 1))
+    limit = int(request.args.get('limit', 10))
+    skip = (page - 1) * limit
+    
+    # Get only authentication-related actions
+    query = {"action": {"$in": ["login", "register", "reset_password"]}}
+    
+    total = db.audit_logs.count_documents(query)
+    logs = list(db.audit_logs.find(query)
+                 .sort("timestamp", -1)
+                 .skip(skip)
+                 .limit(limit))
+    
+    activities = []
+    for log in logs:
+        user = db.users.find_one({"_id": log["user_id"]})
+        activities.append({
+            "timestamp": log["timestamp"],
+            "username": user["username"] if user else "Unknown",
+            "action": log["action"],
+            "details": log.get("details", {})
+        })
+    
+    return jsonify({
+        "activities": activities,
+        "total": total
+    })
 
 
 #   =====   AUTH    =====
@@ -211,6 +288,7 @@ def register():
     }
 
     db.users.insert_one(user)
+    log_activity(str(user["_id"]), "register", {"email": email})
 
     try:
         msg = Message(
@@ -264,8 +342,9 @@ def login():
     if not user or not check_password_hash(user["password"], password):
         return jsonify({"msg": "Username atau password salah"}), 401
 
-    # if not user.get("verified", False):
-    #     return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
+    if not user.get("verified", False):
+        return jsonify({"msg": "Akun belum diverifikasi. Silakan masukkan OTP dari email."}), 403
+    log_activity(str(user["_id"]), "login", {"ip": request.remote_addr})
 
     token = create_access_token(identity=str(user["_id"]))
     return jsonify({
@@ -330,6 +409,7 @@ def reset_password():
         }
     )
 
+    log_activity(str(user["_id"]), "reset_password")
     return jsonify({"msg": "Password berhasil direset. Silakan login dengan password baru."}), 200
 
 
@@ -531,7 +611,7 @@ def upload():
         return jsonify({'error': 'Empty filename'}), 400
 
     try:
-        # Baca gambar dari stream
+        # Baca gambar
         in_memory_file = file.read()
         npimg = np.frombuffer(in_memory_file, np.uint8)
         img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
@@ -545,23 +625,25 @@ def upload():
         custom_config = r'--oem 3 --psm 6'
         text = pytesseract.image_to_string(thresh, config=custom_config)
 
-        # Ekstraksi item + harga
-        lines = text.split('\n')
+        # Ekstraksi
+        lines = text.splitlines()
         extracted_items = []
+        pattern = re.compile(r'^(.*?)(?:\s*[-:])?\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
 
         for line in lines:
             line = line.strip()
-            match = re.search(r'^(.*?)[\s\-:]+Rp?\s?([\d\.,]+)', line)
+            if not line:
+                continue
+
+            match = pattern.search(line)
             if match:
                 nama_item = match.group(1).strip()
                 harga_str = match.group(2).replace('.', '').replace(',', '.')
+                if any(keyword in nama_item.lower() for keyword in ['total', 'metode', 'jumlah', 'bayar']):
+                    continue
                 try:
                     harga = float(harga_str)
-                except:
-                    continue
-
-                # Saring baris total/metode
-                if 'total' in nama_item.lower() or 'metode' in nama_item.lower():
+                except ValueError:
                     continue
 
                 extracted_items.append({
