@@ -479,7 +479,7 @@ def delete_account(acc_id):
 
 
 #   ===== TRANSACTIONS  =====
-@app.route("/transaction", methods=["POST"])
+@app.route("/transaction", methods=["POST"]) 
 @jwt_required()
 def add_transaction():
     user_id = get_jwt_identity()
@@ -601,65 +601,191 @@ def get_summary():
 
 #   =====   OCR =====
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image uploaded'}), 400
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def preprocess_image(image_path):
     try:
-        # Baca gambar
-        in_memory_file = file.read()
-        npimg = np.frombuffer(in_memory_file, np.uint8)
-        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-
-        # Preprocessing
+        # Read image using OpenCV
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError("Could not read image")
+            
+        # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Apply thresholding
         thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        
+        return thresh
+    except Exception as e:
+        raise ValueError(f"Image preprocessing failed: {str(e)}")
 
-        # OCR
-        custom_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
+def extract_items_from_text(text):
+    lines = text.splitlines()
+    extracted_items = []
+    pattern = re.compile(r'^(.*?)\s*[-:\s]\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
 
-        # Ekstraksi
-        lines = text.splitlines()
-        extracted_items = []
-        pattern = re.compile(r'^(.*?)(?:\s*[-:])?\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
 
-        for line in lines:
-            line = line.strip()
-            if not line:
+        match = pattern.search(line)
+        if match:
+            item_name = match.group(1).strip()
+            price_str = match.group(2).replace('.', '').replace(',', '.')
+
+            if any(keyword in item_name.lower() for keyword in ['total', 'metode', 'jumlah', 'bayar']):
                 continue
 
-            match = pattern.search(line)
-            if match:
-                nama_item = match.group(1).strip()
-                harga_str = match.group(2).replace('.', '').replace(',', '.')
-                if any(keyword in nama_item.lower() for keyword in ['total', 'metode', 'jumlah', 'bayar']):
-                    continue
-                try:
-                    harga = float(harga_str)
-                except ValueError:
-                    continue
+            try:
+                price = float(price_str)
+            except ValueError:
+                continue
 
-                extracted_items.append({
-                    "nama": nama_item,
-                    "harga": harga
-                })
+            extracted_items.append({
+                "name": item_name,
+                "price": price
+            })
+    
+    return extracted_items
 
-        waktu_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+@app.route("/api/process-receipt", methods=["POST"])
+@jwt_required()
+def process_receipt():
+    user_id = get_jwt_identity()
+    
+    # Check if the post request has the file part
+    if 'file' not in request.files:
+        return jsonify({"msg": "No file part"}), 400
+        
+    file = request.files['file']
+    
+    # If user does not select file, browser may submit an empty part without filename
+    if file.filename == '':
+        return jsonify({"msg": "No selected file"}), 400
+        
+    if not allowed_file(file.filename):
+        return jsonify({"msg": "Invalid file type"}), 400
 
+    try:
+        # Save the file temporarily
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(temp_path)
+        
+        # Preprocess image
+        processed_img = preprocess_image(temp_path)
+        
+        # Save processed image temporarily
+        processed_path = os.path.join(app.config['UPLOAD_FOLDER'], "processed_" + filename)
+        cv2.imwrite(processed_path, processed_img)
+        
+        # Perform OCR
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(processed_img, config=custom_config)
+        
+        # Extract items and prices
+        items = extract_items_from_text(text)
+        total_price = sum(item['price'] for item in items)
+        
+        # Clean up temporary files
+        os.remove(temp_path)
+        os.remove(processed_path)
+        
+        log_activity(user_id, "process_receipt", {"items_count": len(items)})
+        
         return jsonify({
-            "waktu": waktu_now,
-            "items": extracted_items
+            "success": True,
+            "items": items,
+            "total_price": total_price,
+            "raw_text": text
         })
-
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Clean up in case of error
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
+        if 'processed_path' in locals() and os.path.exists(processed_path):
+            os.remove(processed_path)
+            
+        return jsonify({
+            "success": False,
+            "msg": f"Error processing receipt: {str(e)}"
+        }), 500
+
+@app.route("/api/save-receipt-transaction", methods=["POST"])
+@jwt_required()
+def save_receipt_transaction():
+    user_id = get_jwt_identity()
+    data = request.json
+    
+    try:
+        # Validate input
+        required_fields = ['type', 'account', 'items']
+        if not all(field in data for field in required_fields):
+            return jsonify({"msg": f"Missing required fields: {required_fields}"}), 400
+            
+        if not isinstance(data['items'], list) or len(data['items']) == 0:
+            return jsonify({"msg": "Items must be a non-empty list"}), 400
+            
+        # Calculate total price
+        total_price = sum(item['price'] for item in data['items'])
+        
+        # Create transaction
+        txn = {
+            "user_id": ObjectId(user_id),
+            "type": data["type"],  # income / expense
+            "name": data.get("name", "Receipt Transaction"),
+            "items": data["items"],
+            "total_price": total_price,
+            "account": data["account"],
+            "note": data.get("note", ""),
+            "date": datetime.now()
+        }
+        
+        # Insert transaction
+        result = db.transactions.insert_one(txn)
+        
+        # Update account balance    
+        acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": data["account"]})
+        if acc:
+            if data['type'] == "income":
+                new_balance = acc['balance'] + total_price
+            else:
+                new_balance = acc['balance'] - total_price
+
+            db.accounts.update_one(
+                {"_id": acc["_id"]}, 
+                {"$set": {"balance": new_balance}}
+            )
+        
+        log_activity(user_id, "save_receipt_transaction", {
+            "transaction_id": str(result.inserted_id),
+            "account": data["account"],
+            "total_price": total_price
+        })
+        
+        return jsonify({
+            "success": True,
+            "transaction_id": str(result.inserted_id),
+            "msg": "Transaction saved successfully"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "msg": f"Error saving transaction: {str(e)}"
+        }), 500
 
 
 #   =====   RUN =====
