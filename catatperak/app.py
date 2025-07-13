@@ -15,6 +15,7 @@ import os
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import numpy as np
+import math
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
@@ -28,7 +29,6 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 app.secret_key = "uniqekey"
 client = MongoClient("mongodb://localhost:27017/")
 db = client["capstone_app_db"]
-audit_logs = db["audit_logs"]
 jwt = JWTManager(app)
 
 #   =====   CONFIG EMAIL    =====
@@ -48,13 +48,6 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 @app.route("/")
 def landing_page():
     return render_template("index.html")
-
-@app.route("/admin/audit-logs-page")
-@jwt_required()
-def audit_logs_page():
-    if not is_admin(get_jwt_identity()):
-        return redirect(url_for('admin_login'))
-    return render_template("admin_audit_logs.html", username=session.get("admin_username"))
 
 #   =====   UTILS   =====
 def allowed_file(filename):
@@ -85,18 +78,58 @@ def extract_text_from_image(path):
     return pytesseract.image_to_string(img)
 
 def log_activity(user_id, action, details=None):
-    log_entry = {
+    log = {
         "user_id": ObjectId(user_id),
-        "action": action,  # Misal: "login", "register", "reset_password"
-        "details": details or {},  # Data tambahan (misal: email, IP, dll)
-        "timestamp": datetime.now()
+        "action": action,  # "login", "logout", "register", "reset_password"
+        "timestamp": datetime.now(),
+        "details": details or {}
     }
-    audit_logs.insert_one(log_entry)
+    db.audit_logs.insert_one(log)
+
 
 #   =====   UTILS: Admin Check  =====
 def is_admin(user_id):
     user = db.users.find_one({"_id": ObjectId(user_id)})
     return user and user.get("role") == "admin"
+
+@app.route("/audit-log", methods=["GET"])
+@jwt_required()
+def get_audit_log():
+    user_id = get_jwt_identity()
+    logs = db.audit_logs.find({
+        "user_id": ObjectId(user_id),
+        "action": "login"
+    }).sort("timestamp", -1)
+
+    return render_template("audit_log.html", logs=logs)
+
+@app.route("/api/audit-log")
+@jwt_required()
+def api_audit_log():
+    user_id = get_jwt_identity()
+    page = int(request.args.get("page", 1))
+    limit = 10
+    skip = (page - 1) * limit
+
+    logs_cursor = db.audit_logs.find({"user_id": ObjectId(user_id)}).sort("timestamp", -1).skip(skip).limit(limit)
+    total_logs = db.audit_logs.count_documents({"user_id": ObjectId(user_id)})
+
+    logs = []
+    for log in logs_cursor:
+        logs.append({
+            "timestamp": log["timestamp"].isoformat(),
+            "action": log["action"],
+            "details": log.get("details", {}),
+            "username": db.users.find_one({"_id": log["user_id"]}).get("username", "-")
+        })
+
+    return jsonify({
+        "logs": logs,
+        "has_prev": page > 1,
+        "has_next": (page * limit) < total_logs
+    })
+
+
 
 @app.route("/admin/users", methods=["GET"])
 @jwt_required()
@@ -217,7 +250,31 @@ def admin_login():
 def admin_dashboard():
     if "admin_id" not in session:
         return redirect(url_for("admin_login"))
-    return render_template("admin_dashboard.html", username=session["admin_username"])
+    
+    # Get recent login/logout activities for accounting section
+    accounting_activities = list(db.audit_logs.find({
+        "action": {"$in": ["login", "logout"]}
+    }).sort("timestamp", -1).limit(5))
+    
+    # Process activities for accounting display
+    processed_accounting = []
+    for act in accounting_activities:
+        user = db.users.find_one({"_id": act["user_id"]})
+        processed_accounting.append({
+            "platform": "Windows 10",  # Simplified - should parse user agent
+            "browser": "Chrome",       # Simplified - should parse user agent
+            "ip_address": act.get("details", {}).get("ip", "Unknown"),
+            "login_time": act["timestamp"] if act["action"] == "login" else None,
+            "last_activity": act["timestamp"],
+            "logout_time": act["timestamp"] if act["action"] == "logout" else None,
+            "status": "Active" if act["action"] == "login" else "Inactive",
+            "username": user["username"] if user else "Unknown"
+        })
+    
+    return render_template("admin_dashboard.html", 
+                         username=session["admin_username"],
+                         accounting_activities=processed_accounting,
+                         now=datetime.now())
 
 #   =====   ADMIN LOGOUT    =====
 @app.route("/admin/logout")
@@ -227,38 +284,37 @@ def admin_logout():
     return redirect(url_for("admin_login"))
 
 
-@app.route("/admin/recent-auth-logs", methods=["GET"])
-@jwt_required()
-def get_recent_auth_logs():
-    if not is_admin(get_jwt_identity()):
-        return jsonify({"msg": "Unauthorized"}), 403
-    
+@app.route('/admin/recent-auth-logs')
+def recent_auth_logs():
     page = int(request.args.get('page', 1))
     limit = int(request.args.get('limit', 10))
     skip = (page - 1) * limit
-    
-    # Get only authentication-related actions
-    query = {"action": {"$in": ["login", "register", "reset_password"]}}
-    
-    total = db.audit_logs.count_documents(query)
-    logs = list(db.audit_logs.find(query)
-                 .sort("timestamp", -1)
-                 .skip(skip)
-                 .limit(limit))
-    
+
+    # Ambil log dari MongoDB collection 'audit_logs'
+    logs_cursor = db.audit_logs.find(
+        {"action": {"$in": ["login", "logout", "register", "reset_password"]}}
+    ).sort("timestamp", -1).skip(skip).limit(limit)
+
     activities = []
-    for log in logs:
-        user = db.users.find_one({"_id": log["user_id"]})
+    for log in logs_cursor:
+        # Ambil username dari koleksi users
+        user_doc = db.users.find_one({"_id": log["user_id"]})
+        username = user_doc["username"] if user_doc else "Unknown"
+
         activities.append({
-            "timestamp": log["timestamp"],
-            "username": user["username"] if user else "Unknown",
+            "timestamp": log["timestamp"].isoformat(),
+            "username": username,
             "action": log["action"],
-            "details": log.get("details", {})
+            "details": log.get("details", {}),
+            "success": log.get("details", {}).get("success", True)  # Default ke True jika tidak dicatat
         })
-    
+
+    total_logs = db.audit_logs.count_documents({"action": {"$in": ["login", "logout", "register", "reset_password"]}})
+
     return jsonify({
         "activities": activities,
-        "total": total
+        "total": total_logs,
+        "page": page
     })
 
 
@@ -294,8 +350,8 @@ def register():
         "otp_created": datetime.now()
     }
 
-    db.users.insert_one(user)
-    log_activity(str(user["_id"]), "register", {"email": email})
+    result = db.users.insert_one(user)
+    log_activity(str(result.inserted_id), "register", {"email": email})
 
     try:
         msg = Message(
@@ -416,7 +472,7 @@ def reset_password():
         }
     )
 
-    log_activity(str(user["_id"]), "reset_password")
+    log_activity(str(user["_id"]), "reset_password", {"email": email, "ip": request.remote_addr})
     return jsonify({"msg": "Password berhasil direset. Silakan login dengan password baru."}), 200
 
 
@@ -424,8 +480,10 @@ def reset_password():
 @app.route("/logout", methods=["POST"])
 @jwt_required()
 def logout():
-    # Di JWT tidak bisa "logout" server-side tanpa blacklist
+    user_id = get_jwt_identity()
+    log_activity(user_id, "logout", {"ip": request.remote_addr})
     return jsonify({"msg": "Logout berhasil. Silakan hapus token di client."}), 200
+
 
 
 
@@ -685,6 +743,66 @@ def upload_file():
                 {"_id": account["_id"]},
                 {"$inc": {"balance": -total_price}}
             )
+
+        return jsonify({
+            "waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hasil": extracted_items,
+            "total": total_price,
+            "ocr_text": text
+        })
+
+    return jsonify({'error': 'Invalid file format'}), 400
+
+@app.route('/upload/testing', methods=['POST'])
+def upload_file_testing():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image part'}), 400
+
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file and allowed_file(file.filename):
+        npimg = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+        # Preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        # OCR
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+
+        # Ekstraksi
+        lines = text.splitlines()
+        extracted_items = []
+        pattern = re.compile(r'^(.*?)\s*[-:\s]\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            match = pattern.search(line)
+            if match:
+                nama_item = match.group(1).strip()
+                harga_str = match.group(2).replace('.', '').replace(',', '.')
+
+                if any(keyword in nama_item.lower() for keyword in ['total', 'metode', 'jumlah', 'bayar']):
+                    continue
+
+                try:
+                    harga = float(harga_str)
+                    extracted_items.append({
+                        "nama": nama_item,
+                        "harga": harga
+                    })
+                except ValueError:
+                    continue
+
+        total_price = sum(item['harga'] for item in extracted_items)
 
         return jsonify({
             "waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

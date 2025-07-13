@@ -1,0 +1,76 @@
+<!-- templates/admin_transactions.html -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Manajemen Transaksi</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50">
+
+  <div class="p-6">
+    <h1 class="text-2xl font-bold mb-4">💳 Daftar Transaksi</h1>
+
+    <table class="min-w-full bg-white shadow-md rounded-lg overflow-hidden">
+      <thead class="bg-green-600 text-white">
+        <tr>
+          <th class="text-left px-4 py-2">Tipe</th>
+          <th class="text-left px-4 py-2">Nama</th>
+          <th class="text-left px-4 py-2">Item</th>
+          <th class="text-left px-4 py-2">Harga</th>
+          <th class="text-left px-4 py-2">Rekening</th>
+          <th class="text-left px-4 py-2">Aksi</th>
+        </tr>
+      </thead>
+      <tbody id="txn-table-body">
+        <!-- Data akan diisi lewat JS -->
+      </tbody>
+    </table>
+
+    <a href="/admin/dashboard" class="mt-6 inline-block bg-gray-700 text-white px-4 py-2 rounded hover:bg-gray-800">← Kembali ke Dashboard</a>
+  </div>
+
+  <script>
+    async function loadTransactions() {
+      const token = localStorage.getItem("admin_token");
+      const res = await fetch("/admin/transactions", {
+        headers: { "Authorization": "Bearer " + token }
+      });
+      const txns = await res.json();
+      const tbody = document.getElementById("txn-table-body");
+
+      txns.forEach(txn => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td class="border px-4 py-2">${txn.type}</td>
+          <td class="border px-4 py-2">${txn.name}</td>
+          <td class="border px-4 py-2">${txn.item}</td>
+          <td class="border px-4 py-2">Rp${txn.price.toLocaleString()}</td>
+          <td class="border px-4 py-2">${txn.account}</td>
+          <td class="border px-4 py-2">
+            <button onclick="deleteTxn('${txn.id}')" class="bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Hapus</button>
+          </td>
+        `;
+        tbody.appendChild(row);
+      });
+    }
+
+    async function deleteTxn(id) {
+      if (!confirm("Yakin ingin menghapus transaksi ini?")) return;
+      const token = localStorage.getItem("admin_token");
+      const res = await fetch(`/admin/transaction/${id}`, {
+        method: "DELETE",
+        headers: { "Authorization": "Bearer " + token }
+      });
+      if (res.ok) {
+        alert("Transaksi dihapus");
+        location.reload();
+      } else {
+        alert("Gagal menghapus transaksi");
+      }
+    }
+
+    loadTransactions();
+  </script>
+</body>
+</html>

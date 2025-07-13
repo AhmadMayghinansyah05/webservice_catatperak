@@ -1,0 +1,126 @@
+{% extends "admin_base.html" %}
+
+{% block content %}
+<div class="container mx-auto p-6">
+  <div class="flex justify-between items-center mb-6">
+    <h1 class="text-2xl font-bold flex items-center">
+      <i class="fas fa-clipboard-list text-indigo-600 mr-2"></i> Audit Logs
+    </h1>
+    <div class="flex space-x-2">
+      <input type="text" id="search-input" placeholder="Cari user..." class="px-4 py-2 border rounded-lg">
+      <select id="action-filter" class="px-4 py-2 border rounded-lg">
+        <option value="">Semua Aksi</option>
+        <option value="login">Login</option>
+        <option value="register">Register</option>
+        <option value="reset_password">Reset Password</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="bg-white rounded-xl shadow-md overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Waktu</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Aksi</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Detail</th>
+          </tr>
+        </thead>
+        <tbody id="audit-logs-table" class="bg-white divide-y divide-gray-200">
+          <!-- Data akan diisi via JavaScript -->
+          <tr>
+            <td colspan="4" class="px-6 py-4 text-center text-gray-500">Memuat data...</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="px-6 py-4 border-t flex justify-between items-center">
+      <div id="pagination-info" class="text-sm text-gray-600"></div>
+      <div class="flex space-x-2">
+        <button id="prev-btn" class="px-4 py-2 bg-gray-200 rounded disabled:opacity-50">Sebelumnya</button>
+        <button id="next-btn" class="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50">Selanjutnya</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentPage = 1;
+const itemsPerPage = 10;
+
+async function loadAuditLogs(page = 1, search = '', action = '') {
+  try {
+    const url = `/admin/audit-logs?page=${page}&limit=${itemsPerPage}&search=${search}&action=${action}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    const tableBody = document.getElementById('audit-logs-table');
+    tableBody.innerHTML = '';
+    
+    if (data.logs && data.logs.length > 0) {
+      data.logs.forEach(log => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td class="px-6 py-4 whitespace-nowrap">${new Date(log.timestamp).toLocaleString()}</td>
+          <td class="px-6 py-4 whitespace-nowrap">${log.username}</td>
+          <td class="px-6 py-4 whitespace-nowrap">
+            <span class="px-2 py-1 text-xs rounded-full 
+              ${log.action === 'login' ? 'bg-green-100 text-green-800' : 
+                log.action === 'register' ? 'bg-blue-100 text-blue-800' : 
+                'bg-purple-100 text-purple-800'}">
+              ${log.action}
+            </span>
+          </td>
+          <td class="px-6 py-4 whitespace-nowrap max-w-xs truncate">${JSON.stringify(log.details || {})}</td>
+        `;
+        tableBody.appendChild(row);
+      });
+      
+      document.getElementById('pagination-info').textContent = 
+        `Menampilkan ${(page - 1) * itemsPerPage + 1}-${Math.min(page * itemsPerPage, data.total)} dari ${data.total} log`;
+      
+      document.getElementById('prev-btn').disabled = page <= 1;
+      document.getElementById('next-btn').disabled = page * itemsPerPage >= data.total;
+    } else {
+      tableBody.innerHTML = `
+        <tr>
+          <td colspan="4" class="px-6 py-4 text-center text-gray-500">Tidak ada data log</td>
+        </tr>
+      `;
+    }
+  } catch (error) {
+    console.error('Error loading audit logs:', error);
+  }
+}
+
+// Event listeners
+document.getElementById('search-input').addEventListener('input', (e) => {
+  currentPage = 1;
+  loadAuditLogs(currentPage, e.target.value, document.getElementById('action-filter').value);
+});
+
+document.getElementById('action-filter').addEventListener('change', (e) => {
+  currentPage = 1;
+  loadAuditLogs(currentPage, document.getElementById('search-input').value, e.target.value);
+});
+
+document.getElementById('prev-btn').addEventListener('click', () => {
+  if (currentPage > 1) {
+    currentPage--;
+    loadAuditLogs(currentPage, document.getElementById('search-input').value, document.getElementById('action-filter').value);
+  }
+});
+
+document.getElementById('next-btn').addEventListener('click', () => {
+  currentPage++;
+  loadAuditLogs(currentPage, document.getElementById('search-input').value, document.getElementById('action-filter').value);
+});
+
+// Load initial data
+document.addEventListener('DOMContentLoaded', () => {
+  loadAuditLogs(currentPage);
+});
+</script>
+{% endblock %}
