@@ -1,5 +1,6 @@
 from flask import Flask, render_template, redirect, url_for, session, request, jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import requests
 from werkzeug.security import generate_password_hash, check_password_hash
 from pymongo import MongoClient
 from bson import ObjectId
@@ -16,6 +17,9 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import numpy as np
 import math
+import json
+from google.oauth2 import id_token
+from google.auth.transport import requests as grequests
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
@@ -35,9 +39,14 @@ jwt = JWTManager(app)
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'eghinansyah554@gmail.com' 
+app.config['MAIL_USERNAME'] = 'sjlkcompany@gmail.com' 
 app.config['MAIL_PASSWORD'] = 'sget djzi easq efec'
 mail = Mail(app)
+
+#   =====   GOOGLE AUTH     =====
+GOOGLE_CLIENT_ID = '1017030183926-nn806v03apkfj34iu8lv20fd2mmb57tb.apps.googleusercontent.com'
+GOOGLE_CLIENT_SECRET = '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'
+REDIRECT_URI = 'http://localhost:5000/auth/google/callback'
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -476,7 +485,6 @@ def reset_password():
     return jsonify({"msg": "Password berhasil direset. Silakan login dengan password baru."}), 200
 
 
-
 @app.route("/logout", methods=["POST"])
 @jwt_required()
 def logout():
@@ -484,8 +492,90 @@ def logout():
     log_activity(user_id, "logout", {"ip": request.remote_addr})
     return jsonify({"msg": "Logout berhasil. Silakan hapus token di client."}), 200
 
+@app.route("/auth/google")
+def login_google():
+    # Redirect ke halaman login Google
+    return redirect(
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=openid%20email%20profile"
+    )
 
+@app.route("/auth/google/callback")
+def callback():
+    code = request.args.get("code")
+    if not code:
+        return jsonify({"error": "No code provided"}), 400
 
+    # Tukarkan code dengan access token
+    token_url = "https://oauth2.googleapis.com/token"
+    token_data = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code"
+    }
+
+    token_response = requests.post(token_url, data=token_data)
+    token_json = token_response.json()
+
+    if "error" in token_json:
+        return jsonify(token_json), 400
+
+    # Verifikasi ID Token
+    try:
+        id_info = id_token.verify_oauth2_token(
+            token_json["id_token"],
+            grequests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    # Buat token login JWT untuk backend
+    user_data = {
+        "email": id_info["email"],
+        "name": id_info.get("name"),
+        "picture": id_info.get("picture")
+    }
+    access_token = create_access_token(identity=user_data["email"], additional_claims=user_data)
+
+    return jsonify({
+        "access_token": access_token,
+        "user": user_data
+    })
+
+@app.route('/auth/mobile', methods=['POST'])
+def google_mobile_login():
+    data = request.get_json()
+    id_token_str = data.get("id_token")
+
+    if not id_token_str:
+        return jsonify({"error": "Missing id_token"}), 400
+
+    try:
+        id_info = id_token.verify_oauth2_token(
+            id_token_str,
+            grequests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    user_data = {
+        "email": id_info["email"],
+        "name": id_info.get("name"),
+        "picture": id_info.get("picture")
+    }
+    access_token = create_access_token(identity=user_data["email"], additional_claims=user_data)
+
+    return jsonify({
+        "access_token": access_token,
+        "user": user_data
+    })
 
 #   =====   ACCOUNT =====
 @app.route("/account", methods=["POST"])
@@ -544,7 +634,7 @@ def delete_account(acc_id):
 
 
 #   ===== TRANSACTIONS  =====
-@app.route("/transaction", methods=["POST"]) 
+@app.route("/transaction", methods=["POST"])
 @jwt_required()
 def add_transaction():
     user_id = get_jwt_identity()
@@ -558,10 +648,10 @@ def add_transaction():
 
     txn = {
         "user_id": ObjectId(user_id),
-        "type": data["type"],  # income / expense
+        "type": data["type"],  
         "name": data["name"],
         "items": items,
-        "total_price": total_price,
+        "total_price": int(total_price),
         "account": data["account"],
         "note": data.get("note", ""),
         "date": datetime.now()
@@ -572,9 +662,9 @@ def add_transaction():
     acc = db.accounts.find_one({"user_id": ObjectId(user_id), "name": data["account"]})
     if acc:
         if data['type'] == "income":
-            new_balance = acc['balance'] + total_price
+            new_balance = int(acc['balance'] + total_price)
         if data['type'] == "expense":
-            new_balance = acc['balance'] - total_price
+            new_balance = int(acc['balance'] - total_price)
 
         db.accounts.update_one({"_id": acc["_id"]}, {"$set": {"balance": new_balance}})
     return jsonify({"msg": "Transaksi ditambahkan"}), 201
@@ -660,9 +750,9 @@ def delete_transaction(txn_id):
 def get_summary():
     user_id = get_jwt_identity()
     txns = list(db.transactions.find({"user_id": ObjectId(user_id)}))
-    income = sum(t["price"] for t in txns if t["type"] == "income")
-    expense = sum(t["price"] for t in txns if t["type"] == "expense")
-    return jsonify({"total_income": income, "total_expense": expense})
+    income = sum(t["total_price"] for t in txns if t["type"] == "income")
+    expense = sum(t["total_price"] for t in txns if t["type"] == "expense")
+    return jsonify({"total_income": float(income), "total_expense": float(expense)})
 
 #   =====   OCR =====
 
@@ -694,7 +784,7 @@ def upload_file():
         # Ekstraksi
         lines = text.splitlines()
         extracted_items = []
-        pattern = re.compile(r'^(.*?)\s*[-:\s]\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
+        pattern = re.compile(r'^(.*?)\s+Rp[\s]?([\d.,]+)', re.IGNORECASE)
 
         for line in lines:
             line = line.strip()
@@ -722,87 +812,27 @@ def upload_file():
         total_price = sum(item['harga'] for item in extracted_items)
 
         # Simpan transaksi ke DB
-        account_name = "Dompet"  # default akun
-        data_transaksi = {
-            "user_id": ObjectId(user_id),
-            "type": "expense",
-            "name": "Belanja dari Struk",
-            "items": extracted_items,
-            "total_price": total_price,
-            "account": account_name,
-            "note": "Transaksi otomatis dari OCR",
-            "date": datetime.now()
-        }
+        # account_name = "Dompet"  # default akun
+        # data_transaksi = {
+        #     "user_id": ObjectId(user_id),
+        #     "type": "expense",
+        #     "name": "Belanja dari Struk",
+        #     "items": extracted_items,
+        #     "total_price": total_price,
+        #     "account": account_name,
+        #     "note": "Transaksi otomatis dari OCR",
+        #     "date": datetime.now()
+        # }
 
-        db.transactions.insert_one(data_transaksi)
+        # db.transactions.insert_one(data_transaksi)
 
-        # Update saldo rekening
-        account = db.accounts.find_one({"user_id": ObjectId(user_id), "name": account_name})
-        if account:
-            db.accounts.update_one(
-                {"_id": account["_id"]},
-                {"$inc": {"balance": -total_price}}
-            )
-
-        return jsonify({
-            "waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "hasil": extracted_items,
-            "total": total_price,
-            "ocr_text": text
-        })
-
-    return jsonify({'error': 'Invalid file format'}), 400
-
-@app.route('/upload/testing', methods=['POST'])
-def upload_file_testing():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image part'}), 400
-
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-
-    if file and allowed_file(file.filename):
-        npimg = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-
-        # Preprocessing
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-        # OCR
-        custom_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
-
-        # Ekstraksi
-        lines = text.splitlines()
-        extracted_items = []
-        pattern = re.compile(r'^(.*?)\s*[-:\s]\s*Rp?\s*([\d.,]+)$', re.IGNORECASE)
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            match = pattern.search(line)
-            if match:
-                nama_item = match.group(1).strip()
-                harga_str = match.group(2).replace('.', '').replace(',', '.')
-
-                if any(keyword in nama_item.lower() for keyword in ['total', 'metode', 'jumlah', 'bayar']):
-                    continue
-
-                try:
-                    harga = float(harga_str)
-                    extracted_items.append({
-                        "nama": nama_item,
-                        "harga": harga
-                    })
-                except ValueError:
-                    continue
-
-        total_price = sum(item['harga'] for item in extracted_items)
+        # # Update saldo rekening
+        # account = db.accounts.find_one({"user_id": ObjectId(user_id), "name": account_name})
+        # if account:
+        #     db.accounts.update_one(
+        #         {"_id": account["_id"]},
+        #         {"$inc": {"balance": -total_price}}
+        #     )
 
         return jsonify({
             "waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
